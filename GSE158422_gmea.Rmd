@@ -1,0 +1,194 @@
+---
+title: "GSE158422: DNA methylation in Lung squamous cell carcinoma - gene methylation enrichment analysis"
+author: "The GMEA team"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    fig_width: 7
+    fig_height: 7
+theme: cosmo
+---
+
+## Introduction
+
+Functional class sorting is widely used for pathway analysis using tools like GSEA,
+yet there is no consensus in how this can be conducted for Illumina Infinium
+methylation array data.
+
+Here we propose a simple approach which involves the following:
+
+1. Limma test on probes.
+
+2. For each gene, calculate the median t-statistic from step 1.
+
+3. Use this median t-stat in Camera pre-ranked test for gene sets.
+
+In this example, I'm using matched infinium EPIC 850k data from (n=37) normal and lung cancer samples (GSE158422).
+The data was previously preprocessed and normalised using the minfi package (see the folder called "misc").
+
+Here the gene sets are obtained from Reactome.
+
+## Requirements
+
+This analysis was run on a 8C/16T computer with 64GB RAM running at 3.8 GHz.
+This workflow used 34 GB RAM and took
+RAM usage can be moderated by reducing the parallel core count.
+
+```{r,packages}
+
+suppressPackageStartupMessages({
+  library("limma")
+  library("IlluminaHumanMethylation450kmanifest")
+  library("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+  library("tictoc")
+  library("kableExtra")
+  library("beeswarm")
+})
+
+```
+
+## Load data
+
+* annotations
+
+* probe sets
+
+* gene sets
+
+* design matrix
+
+* mval matrix
+
+```{r,annotation}
+
+anno <- getAnnotation(IlluminaHumanMethylationEPICanno.ilm10b4.hg19)
+myann <- data.frame(anno[,c("UCSC_RefGene_Name","Regulatory_Feature_Group","Islands_Name","Relation_to_Island")])
+
+gp <- myann[,"UCSC_RefGene_Name",drop=FALSE]
+gp2 <- strsplit(gp$UCSC_RefGene_Name,";")
+names(gp2) <- rownames(gp)
+sets <- split(rep(names(gp2), lengths(gp2)), unlist(gp2))
+
+summary(unlist(lapply(sets,length)))
+
+gmt_import <- function(gmtfile) {
+    genesetLines <- strsplit(readLines(gmtfile), "\t")
+    genesets <- lapply(genesetLines, utils::tail, -2)
+    names(genesets) <- unlist(lapply(genesetLines, head, 1))
+    attributes(genesets)$originfile <- gmtfile
+    if( any(duplicated(names(genesets))) ) {
+        warning("Duplicated gene sets names detected")
+    }
+    genesets
+}
+
+genesets <- gmt_import("https://ziemann-lab.net/public/gmea_prototype/ReactomePathways.gmt")
+
+if (!file.exists("GSE158422_design.rds")) {
+  download.file("https://ziemann-lab.net/public/gmea_prototype/GSE158422_design.rds", "GSE158422_design.rds")
+}
+design <- readRDS("GSE158422_design.rds")
+
+if (!file.exists("GSE158422_design.rds")) {
+ download.file("https://ziemann-lab.net/public/gmea_prototype/GSE158422_mx.rds","GSE158422_mx.rds")
+}
+mval <- readRDS("GSE158422_mx.rds")
+
+```
+
+## Gene level analysis
+
+Performs limma on probes and then reports the median limma t-statistic for each gene.
+
+It also applies a one-sample t-test for probes belonging to each gene, but that isn't
+used in downstream gene set analysis.
+
+```{r,pmea}
+
+pmea <- function(mval,design,sets,cores=2) {
+  fit <- lmFit(mval, design)
+  fit <- eBayes(fit)
+  top <- topTable(fit,coef=ncol(design),num=Inf, sort.by = "P")
+  l <- mclapply(seq(1,length(sets)), function(i) {
+    g <- names(sets[i])
+    tstats <- top[rownames(top) %in% sets[[i]],"t"]
+    myn <- length(tstats)
+    mymean <- mean(tstats)
+    mymedian <- median(tstats)
+    if ( length(tstats) < 2 ) {
+      pval=1
+    } else {
+      wtselfcont <- t.test(tstats)
+      pval=wtselfcont$p.value
+    }
+    c("gene"=g,"nprobes"=myn,"mean"=mymean,"median"=mymedian,
+      "P.Value"=pval)
+  } , mc.cores=cores)
+  df <- do.call(rbind, l)
+  rownames(df) <- df[,1]
+  df <- df[,-1]
+  tmp <- apply(df,2,as.numeric)
+  rownames(tmp) <- rownames(df)
+  df <- as.data.frame(tmp)
+  df$sig <- -log10(df[,4])
+  df <- df[order(-df$sig),]
+  df$FDR <- p.adjust(df$P.Value)
+  out <- list("df"=df,"toptable"=top)
+  return(out)
+}
+
+tic()
+res <- pmea(mval,design,sets,cores=8)
+resdf <- res$df
+toc()
+
+head(resdf,20) %>%
+  kbl(caption="GMEA gene level analysis top results (p-value)") %>%
+  kable_styling(full_width=FALSE)
+
+```
+
+## Gene set analysis
+
+Now perform gene set analysis using CameraPR with reactome gene sets.
+
+```{r,camerapr_gene_set}
+
+tic()
+stat <- resdf$median
+names(stat) <- rownames(resdf)
+stat[is.na(stat)] <- 0
+cres <- cameraPR(statistic=stat, index=genesets, use.ranks = FALSE, inter.gene.cor=0.01, sort = FALSE)
+cres$ES <- unlist(lapply(genesets, function(gset) {median(stat[which(names(stat) %in% gset )]) }))
+cres <- cres[order(cres$PValue),]
+toc()
+
+top <- head(cres,10)
+
+top %>%
+  kbl(caption="CameraPR gene set results") %>%
+  kable_styling(full_width=FALSE)
+
+top <- top[order(top$ES),]
+topsets <- genesets[names(genesets) %in% rownames(top)]
+
+scores <- lapply(topsets, function(gset) { stat[which(names(stat) %in% gset )] })
+scores <- scores[order(unlist(lapply(scores,median)))]
+
+par(mar=c(5,25,3,1))
+boxplot(scores,horizontal=TRUE,las=1,cex=0,cex.axis=0.9,xlab="Enrichment score")
+mtext("Top pathways in lung cancer")
+beeswarm(scores,add=TRUE,horiz=TRUE,pch=19,cex=0.3)
+grid()
+
+```
+
+## Session information
+
+```{r,save}
+
+sessionInfo()
+
+```
